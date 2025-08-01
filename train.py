@@ -1,3 +1,8 @@
+"""
+Simplified training script that uses the main.py functionality.
+This version removes redundancy and focuses on the core training loop with better logging.
+"""
+
 import torch
 import torch.nn as nn
 import numpy as np
@@ -10,9 +15,10 @@ import argparse
 from typing import Dict, Tuple, Optional
 
 # Import your modules
-from models import PPOAgent
+from agent import PPOAgent
 from environment import PrisonersDilemmaEnv
 from ppo import PPO
+from buffer import RolloutBuffer
 
 # Optional: Import logging libraries if available
 try:
@@ -30,46 +36,8 @@ except ImportError:
     print("Warning: tensorboard not available")
 
 
-class RolloutBuffer:
-    """Buffer for storing self-play rollouts with RNN support"""
-    
-    def __init__(self):
-        self.reset()
-    
-    def reset(self):
-        self.data = defaultdict(list)
-        self.episode_starts = []
-    
-    def add(self, **kwargs):
-        for k, v in kwargs.items():
-            self.data[k].append(v)
-    
-    def get_batch(self, device='cpu') -> Dict[str, torch.Tensor]:
-        """Convert lists to tensors and prepare batch for PPO update"""
-        batch = {}
-        
-        # Stack temporal data
-        for k in ['obs', 'actions', 'logprobs', 'values', 'rewards', 'dones', 'masks']:
-            if k in self.data:
-                batch[k] = torch.stack(self.data[k], dim=0).to(device)
-        
-        # Handle last values (no temporal dimension)
-        if 'last_values' in self.data:
-            batch['last_values'] = self.data['last_values'][0].to(device)
-        
-        # Handle initial hidden states
-        if 'h0' in self.data and self.data['h0']:
-            h0 = self.data['h0'][0]
-            if isinstance(h0, tuple):
-                batch['h0'] = tuple(h.to(device) for h in h0)
-            else:
-                batch['h0'] = h0.to(device)
-        
-        return batch
-
-
 class SelfPlayTrainer:
-    """Main trainer for self-play PPO"""
+    """Improved self-play trainer with better environment handling"""
     
     def __init__(self, config):
         self.config = config
@@ -83,33 +51,22 @@ class SelfPlayTrainer:
             seed=config.seed
         )
         
-        # Policy networks (shared for self-play or separate)
-        obs_dim = self.env.observation_space.shape[0]
-        if config.shared_policy:
-            self.agent = PPOAgent(
-                obs_dim=obs_dim,
-                hidden_size=config.hidden_size,
-                rnn_type=config.rnn_type,
-                num_layers=config.num_layers
-            ).to(self.device)
-            self.agent_A = self.agent_B = self.agent
-        else:
-            self.agent_A = PPOAgent(
-                obs_dim=obs_dim,
-                hidden_size=config.hidden_size,
-                rnn_type=config.rnn_type,
-                num_layers=config.num_layers
-            ).to(self.device)
-            self.agent_B = PPOAgent(
-                obs_dim=obs_dim,
-                hidden_size=config.hidden_size,
-                rnn_type=config.rnn_type,
-                num_layers=config.num_layers
-            ).to(self.device)
+        # Get observation dimension
+        sample_obs = self.env.reset()['A']
+        obs_dim = sample_obs.shape[0]
         
-        # PPO trainers
-        self.ppo_A = PPO(
-            self.agent_A,
+        # Policy network (shared for self-play)
+        self.agent = PPOAgent(
+            obs_dim=obs_dim,
+            hidden_size=config.hidden_size,
+            rnn_type=config.rnn_type,
+            num_layers=config.num_layers,
+            device=self.device
+        )
+        
+        # PPO trainer
+        self.ppo = PPO(
+            self.agent,
             lr=config.lr,
             clip_epsilon=config.clip_epsilon,
             epochs=config.ppo_epochs,
@@ -123,23 +80,6 @@ class SelfPlayTrainer:
             recurrent=True,
             device=self.device
         )
-        
-        if not config.shared_policy:
-            self.ppo_B = PPO(
-                self.agent_B,
-                lr=config.lr,
-                clip_epsilon=config.clip_epsilon,
-                epochs=config.ppo_epochs,
-                batch_size=config.batch_size,
-                gamma=config.gamma,
-                gae_lambda=config.gae_lambda,
-                value_coef=config.value_coef,
-                entropy_coef=config.entropy_coef,
-                max_grad_norm=config.max_grad_norm,
-                clip_value_loss=config.clip_value_loss,
-                recurrent=True,
-                device=self.device
-            )
         
         # Logging
         self.setup_logging()
@@ -171,138 +111,120 @@ class SelfPlayTrainer:
         if TENSORBOARD_AVAILABLE and self.config.use_tensorboard:
             self.writer = SummaryWriter(os.path.join(self.log_dir, "tensorboard"))
     
-    def collect_rollouts(self, num_envs: int, num_steps: int) -> Tuple[RolloutBuffer, RolloutBuffer]:
-        """Collect self-play rollouts for both agents"""
-        buffer_A = RolloutBuffer()
-        buffer_B = RolloutBuffer()
+    def collect_rollout(self, num_steps: int) -> RolloutBuffer:
+        """Collect a single environment rollout for self-play"""
+        buffer = RolloutBuffer(gamma=self.config.gamma, lam=self.config.gae_lambda)
         
-        # Initialize environments and hidden states
-        envs = [PrisonersDilemmaEnv(
-            max_steps=self.config.env_max_steps,
-            history_length=self.config.history_length,
-            temptation_range=(self.config.temptation_low, self.config.temptation_high),
-            seed=self.config.seed + i if self.config.seed else None
-        ) for i in range(num_envs)]
+        # Reset environment and agent
+        obs_dict = self.env.reset()
+        obs_A = torch.tensor(obs_dict['A'], dtype=torch.float32, device=self.device)
+        obs_B = torch.tensor(obs_dict['B'], dtype=torch.float32, device=self.device)
         
-        obs_dict = [env.reset() for env in envs]
-        obs_A = torch.stack([torch.tensor(o['A'], dtype=torch.float32) for o in obs_dict]).to(self.device)
-        obs_B = torch.stack([torch.tensor(o['B'], dtype=torch.float32) for o in obs_dict]).to(self.device)
+        # Reset hidden states for both agents
+        self.agent.reset_hidden(batch_size=1)
+        h0_A = self.agent.hidden_state
+        h0_B = self.agent.net.initial_state(1, device=self.device)
         
-        h_A = self.agent_A.initial_state(num_envs, device=self.device)
-        h_B = self.agent_B.initial_state(num_envs, device=self.device)
+        buffer.set_initial_hidden(h0_A)
         
-        # Store initial hidden states
-        buffer_A.data['h0'].append(h_A)
-        buffer_B.data['h0'].append(h_B)
+        episode_reward_A = 0.0
+        episode_reward_B = 0.0
+        episode_length = 0
+        cooperation_count = 0
         
-        episode_rewards_A = np.zeros(num_envs)
-        episode_rewards_B = np.zeros(num_envs)
-        episode_lengths = np.zeros(num_envs, dtype=int)
-        masks = torch.ones(num_envs, device=self.device)
-        
-        # Collect rollout
         for step in range(num_steps):
-            # Get actions from both agents
-            with torch.no_grad():
-                actions_A, logp_A, values_A, h_A = self.agent_A.act(obs_A, h0=h_A)
-                actions_B, logp_B, values_B, h_B = self.agent_B.act(obs_B, h0=h_B)
+            # Agent A acts
+            self.agent.hidden_state = h0_A
+            out_A = self.agent.act(obs_A)
+            h0_A = self.agent.hidden_state
+            action_A = int(out_A['action'])
             
-            # Execute actions in environments
-            rewards_A = torch.zeros(num_envs, device=self.device)
-            rewards_B = torch.zeros(num_envs, device=self.device)
-            dones = torch.zeros(num_envs, dtype=torch.bool, device=self.device)
+            # Agent B acts (same policy, different hidden state)
+            self.agent.hidden_state = h0_B
+            out_B = self.agent.act(obs_B)
+            h0_B = self.agent.hidden_state
+            action_B = int(out_B['action'])
             
-            next_obs_A = []
-            next_obs_B = []
+            # Step environment
+            next_obs_dict, rewards, done, _ = self.env.step({
+                'A': action_A, 
+                'B': action_B
+            })
             
-            for i, env in enumerate(envs):
-                actions = (actions_A[i].item(), actions_B[i].item())
-                obs_dict, reward_dict, done, _ = env.step(actions)
-                
-                rewards_A[i] = reward_dict['A']
-                rewards_B[i] = reward_dict['B']
-                dones[i] = done
-                
-                if done:
-                    # Log episode stats
-                    self.log_episode_stats({
-                        'episode_reward_A': episode_rewards_A[i] + rewards_A[i].item(),
-                        'episode_reward_B': episode_rewards_B[i] + rewards_B[i].item(),
-                        'episode_length': episode_lengths[i] + 1,
-                        'cooperation_rate': self.calculate_cooperation_rate(env)
-                    })
-                    
-                    # Reset environment
-                    obs_dict = env.reset()
-                    episode_rewards_A[i] = 0
-                    episode_rewards_B[i] = 0
-                    episode_lengths[i] = 0
-                    self.episode_count += 1
-                else:
-                    episode_rewards_A[i] += rewards_A[i].item()
-                    episode_rewards_B[i] += rewards_B[i].item()
-                    episode_lengths[i] += 1
-                
-                next_obs_A.append(torch.tensor(obs_dict['A'], dtype=torch.float32))
-                next_obs_B.append(torch.tensor(obs_dict['B'], dtype=torch.float32))
+            reward_A = rewards['A']
+            reward_B = rewards['B']
+            episode_reward_A += reward_A
+            episode_reward_B += reward_B
+            episode_length += 1
             
-            next_obs_A = torch.stack(next_obs_A).to(self.device)
-            next_obs_B = torch.stack(next_obs_B).to(self.device)
+            # Track cooperation
+            if action_A == 0 and action_B == 0:
+                cooperation_count += 1
             
-            # Store transitions
-            buffer_A.add(
-                obs=obs_A,
-                actions=actions_A,
-                logprobs=logp_A,
-                values=values_A,
-                rewards=rewards_A,
-                dones=dones,
-                masks=masks.clone()
+            # Store transitions for both agents
+            mask = 0.0 if done else 1.0
+            
+            # Agent A's experience
+            buffer.add_step(
+                obs=obs_A.unsqueeze(0),  # Add batch dimension
+                action=torch.tensor([action_A], dtype=torch.long),
+                logprob=out_A['log_prob'].unsqueeze(0),
+                value=out_A['value'].unsqueeze(0),
+                reward=torch.tensor([reward_A], dtype=torch.float32),
+                done=torch.tensor([done], dtype=torch.float32),
+                mask=torch.tensor([mask], dtype=torch.float32)
             )
             
-            buffer_B.add(
-                obs=obs_B,
-                actions=actions_B,
-                logprobs=logp_B,
-                values=values_B,
-                rewards=rewards_B,
-                dones=dones,
-                masks=masks.clone()
+            # Agent B's experience
+            buffer.add_step(
+                obs=obs_B.unsqueeze(0),  # Add batch dimension
+                action=torch.tensor([action_B], dtype=torch.long),
+                logprob=out_B['log_prob'].unsqueeze(0),
+                value=out_B['value'].unsqueeze(0),
+                reward=torch.tensor([reward_B], dtype=torch.float32),
+                done=torch.tensor([done], dtype=torch.float32),
+                mask=torch.tensor([mask], dtype=torch.float32)
             )
             
-            # Update observations and masks
-            obs_A = next_obs_A
-            obs_B = next_obs_B
-            masks = (~dones).float()
+            # Update observations
+            obs_A = torch.tensor(next_obs_dict['A'], dtype=torch.float32, device=self.device)
+            obs_B = torch.tensor(next_obs_dict['B'], dtype=torch.float32, device=self.device)
             
-            # Reset hidden states for done episodes
-            if self.config.rnn_type == "lstm":
-                h_A = (h_A[0] * masks.unsqueeze(0).unsqueeze(-1),
-                       h_A[1] * masks.unsqueeze(0).unsqueeze(-1))
-                h_B = (h_B[0] * masks.unsqueeze(0).unsqueeze(-1),
-                       h_B[1] * masks.unsqueeze(0).unsqueeze(-1))
-            else:
-                h_A = h_A * masks.unsqueeze(0).unsqueeze(-1)
-                h_B = h_B * masks.unsqueeze(0).unsqueeze(-1)
+            self.global_step += 1
             
-            self.global_step += num_envs
+            if done:
+                # Log episode stats
+                cooperation_rate = cooperation_count / episode_length if episode_length > 0 else 0.0
+                self.log_episode_stats({
+                    'episode_reward_A': episode_reward_A,
+                    'episode_reward_B': episode_reward_B,
+                    'episode_length': episode_length,
+                    'cooperation_rate': cooperation_rate,
+                    'mutual_cooperation_count': cooperation_count
+                })
+                
+                # Reset for next episode within the rollout
+                obs_dict = self.env.reset()
+                obs_A = torch.tensor(obs_dict['A'], dtype=torch.float32, device=self.device)
+                obs_B = torch.tensor(obs_dict['B'], dtype=torch.float32, device=self.device)
+                
+                # Reset hidden states
+                self.agent.reset_hidden(batch_size=1)
+                h0_A = self.agent.hidden_state
+                h0_B = self.agent.net.initial_state(1, device=self.device)
+                
+                episode_reward_A = 0.0
+                episode_reward_B = 0.0
+                episode_length = 0
+                cooperation_count = 0
+                self.episode_count += 1
         
-        # Compute last values for GAE
-        with torch.no_grad():
-            _, _, last_values_A, _ = self.agent_A.act(obs_A, h0=h_A)
-            _, _, last_values_B, _ = self.agent_B.act(obs_B, h0=h_B)
+        # Bootstrap last values
+        self.agent.hidden_state = h0_A
+        last_value_A = self.agent.get_value(obs_A)
+        buffer.set_last_value(last_value_A.unsqueeze(0))
         
-        buffer_A.data['last_values'].append(last_values_A)
-        buffer_B.data['last_values'].append(last_values_B)
-        
-        return buffer_A, buffer_B
-    
-    def calculate_cooperation_rate(self, env) -> float:
-        """Calculate cooperation rate from environment history"""
-        if not env.history:
-            return 0.0
-        cooperations = sum(1 for a_A, a_B, _ in env.history if a_A == 0 and a_B == 0)
-        return cooperations / len(env.history)
+        return buffer
     
     def log_episode_stats(self, stats: dict):
         """Log episode statistics"""
@@ -317,21 +239,16 @@ class SelfPlayTrainer:
             for key, value in stats.items():
                 self.writer.add_scalar(f'episode/{key}', value, self.episode_count)
     
-    def log_training_stats(self, stats_A: dict, stats_B: dict):
+    def log_training_stats(self, stats: dict):
         """Log training statistics"""
-        stats = {
-            **{f'agent_A/{k}': v for k, v in stats_A.items()},
-            **{f'agent_B/{k}': v for k, v in stats_B.items()},
-            'global_step': self.global_step
-        }
+        log_stats = {**stats, 'global_step': self.global_step}
         
         if WANDB_AVAILABLE and self.config.use_wandb:
-            wandb.log(stats)
+            wandb.log(log_stats)
         
         if TENSORBOARD_AVAILABLE and self.config.use_tensorboard:
             for key, value in stats.items():
-                if key != 'global_step':
-                    self.writer.add_scalar(f'train/{key}', value, self.global_step)
+                self.writer.add_scalar(f'train/{key}', value, self.global_step)
     
     def save_checkpoint(self, iteration: int):
         """Save model checkpoint"""
@@ -342,22 +259,15 @@ class SelfPlayTrainer:
             'iteration': iteration,
             'global_step': self.global_step,
             'episode_count': self.episode_count,
+            'agent_state_dict': self.agent.state_dict(),
+            'optimizer_state_dict': self.ppo.optimizer.state_dict(),
             'config': vars(self.config)
         }
-        
-        if self.config.shared_policy:
-            checkpoint['agent_state_dict'] = self.agent.state_dict()
-            checkpoint['optimizer_state_dict'] = self.ppo_A.optimizer.state_dict()
-        else:
-            checkpoint['agent_A_state_dict'] = self.agent_A.state_dict()
-            checkpoint['agent_B_state_dict'] = self.agent_B.state_dict()
-            checkpoint['optimizer_A_state_dict'] = self.ppo_A.optimizer.state_dict()
-            checkpoint['optimizer_B_state_dict'] = self.ppo_B.optimizer.state_dict()
         
         path = os.path.join(checkpoint_dir, f'checkpoint_{iteration}.pt')
         torch.save(checkpoint, path)
         
-        # Save best/latest links
+        # Save latest link
         latest_path = os.path.join(checkpoint_dir, 'checkpoint_latest.pt')
         if os.path.exists(latest_path):
             os.remove(latest_path)
@@ -369,15 +279,8 @@ class SelfPlayTrainer:
         """Load model checkpoint"""
         checkpoint = torch.load(path, map_location=self.device)
         
-        if self.config.shared_policy:
-            self.agent.load_state_dict(checkpoint['agent_state_dict'])
-            self.ppo_A.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        else:
-            self.agent_A.load_state_dict(checkpoint['agent_A_state_dict'])
-            self.agent_B.load_state_dict(checkpoint['agent_B_state_dict'])
-            self.ppo_A.optimizer.load_state_dict(checkpoint['optimizer_A_state_dict'])
-            self.ppo_B.optimizer.load_state_dict(checkpoint['optimizer_B_state_dict'])
-        
+        self.agent.load_state_dict(checkpoint['agent_state_dict'])
+        self.ppo.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         self.global_step = checkpoint['global_step']
         self.episode_count = checkpoint['episode_count']
         
@@ -391,48 +294,37 @@ class SelfPlayTrainer:
         
         start_time = time.time()
         
-        for iteration in range(self.config.num_iterations):
+        for iteration in range(1, self.config.num_iterations + 1):
             iter_start_time = time.time()
             
-            # Collect rollouts
-            buffer_A, buffer_B = self.collect_rollouts(
-                num_envs=self.config.num_envs,
-                num_steps=self.config.rollout_length
-            )
+            # Collect rollout
+            buffer = self.collect_rollout(self.config.rollout_length)
             
-            # Get batches
-            batch_A = buffer_A.get_batch(self.device)
-            batch_B = buffer_B.get_batch(self.device)
+            # Get batch for training
+            batch = buffer.get_batch(self.device)
             
-            # PPO updates
-            stats_A = self.ppo_A.update(batch_A)
-            if self.config.shared_policy:
-                stats_B = stats_A  # Same stats for shared policy
-            else:
-                stats_B = self.ppo_B.update(batch_B)
+            # PPO update
+            stats = self.ppo.update(batch)
             
             # Log stats
-            self.log_training_stats(stats_A, stats_B)
+            self.log_training_stats(stats)
             
             # Print progress
             if iteration % self.config.log_interval == 0:
                 elapsed = time.time() - start_time
                 iter_time = time.time() - iter_start_time
-                fps = (self.config.num_envs * self.config.rollout_length) / iter_time
+                fps = self.config.rollout_length / iter_time
                 
                 print(f"\nIteration {iteration}/{self.config.num_iterations}")
                 print(f"  Global Step: {self.global_step}")
                 print(f"  Episodes: {self.episode_count}")
                 print(f"  FPS: {fps:.1f}")
                 print(f"  Elapsed: {elapsed/60:.1f} min")
-                print(f"  Agent A - Loss: {stats_A['loss_pi']:.4f} (pi) {stats_A['loss_v']:.4f} (v)")
-                print(f"  Agent A - KL: {stats_A['kl']:.4f}, Entropy: {stats_A['entropy']:.4f}")
-                if not self.config.shared_policy:
-                    print(f"  Agent B - Loss: {stats_B['loss_pi']:.4f} (pi) {stats_B['loss_v']:.4f} (v)")
-                    print(f"  Agent B - KL: {stats_B['kl']:.4f}, Entropy: {stats_B['entropy']:.4f}")
+                print(f"  Loss (pi/v): {stats['loss_pi']:.4f} / {stats['loss_v']:.4f}")
+                print(f"  KL/Entropy: {stats['kl']:.4f} / {stats['entropy']:.4f}")
             
             # Save checkpoint
-            if iteration % self.config.save_interval == 0 and iteration > 0:
+            if iteration % self.config.save_interval == 0:
                 self.save_checkpoint(iteration)
         
         # Final checkpoint
@@ -441,6 +333,7 @@ class SelfPlayTrainer:
 
 
 def get_args():
+    """Parse command line arguments"""
     parser = argparse.ArgumentParser(description='PPO Self-Play Training')
     
     # Environment
@@ -453,12 +346,9 @@ def get_args():
     parser.add_argument('--hidden-size', type=int, default=128)
     parser.add_argument('--rnn-type', type=str, default='lstm', choices=['lstm', 'gru'])
     parser.add_argument('--num-layers', type=int, default=1)
-    parser.add_argument('--shared-policy', action='store_true', 
-                        help='Use shared policy for both agents')
     
     # Training
     parser.add_argument('--num-iterations', type=int, default=1000)
-    parser.add_argument('--num-envs', type=int, default=32)
     parser.add_argument('--rollout-length', type=int, default=128)
     parser.add_argument('--batch-size', type=int, default=64)
     parser.add_argument('--ppo-epochs', type=int, default=10)
@@ -496,6 +386,7 @@ if __name__ == "__main__":
     if args.seed is not None:
         torch.manual_seed(args.seed)
         np.random.seed(args.seed)
+        print(f"Set random seed to {args.seed}")
     
     # Create trainer
     trainer = SelfPlayTrainer(args)
