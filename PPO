@@ -1,0 +1,173 @@
+import torch
+import torch.nn as nn
+import torch.optim as optim
+
+def compute_gae(rewards, values, dones, last_values, gamma=0.99, lam=0.95):
+    T, B = rewards.shape
+    adv = torch.zeros_like(rewards)
+    gae = torch.zeros(B, device=rewards.device, dtype=rewards.dtype)
+    next_value = last_values
+    for t in reversed(range(T)):
+        mask = 1.0 - dones[t].float()
+        delta = rewards[t] + gamma * next_value * mask - values[t]
+        gae = delta + gamma * lam * mask * gae
+        adv[t] = gae
+        next_value = values[t]
+    returns = adv + values
+    return adv, returns
+
+class PPO:
+    def __init__(
+        self,
+        policy,
+        lr=3e-4,
+        clip_epsilon=0.2,
+        epochs=10,
+        batch_size=64,
+        gamma=0.99,
+        gae_lambda=0.95,
+        value_coef=0.5,
+        entropy_coef=0.01,
+        max_grad_norm=0.5,
+        clip_value_loss=True,
+        recurrent=True,
+        device=None,
+    ):
+        self.policy = policy
+        self.optimizer = optim.Adam(policy.parameters(), lr=lr)
+        self.clip_epsilon = clip_epsilon
+        self.epochs = epochs
+        self.batch_size = batch_size
+        self.gamma = gamma
+        self.gae_lambda = gae_lambda
+        self.value_coef = value_coef
+        self.entropy_coef = entropy_coef
+        self.max_grad_norm = max_grad_norm
+        self.clip_value_loss = clip_value_loss
+        self.recurrent = recurrent
+        self.device = device or next(policy.parameters()).device
+
+    @torch.no_grad()
+    def _norm_adv(self, adv):
+        m = adv.mean()
+        s = adv.std(unbiased=False)
+        return (adv - m) / (s + 1e-8)
+
+    def update(self, batch):
+        obs = batch["obs"].to(self.device)                # (T,B,...) tensor
+        actions = batch["actions"].to(self.device)        # (T,B,...) tensor or long
+        old_logp = batch["logprobs"].to(self.device)      # (T,B)
+        values = batch["values"].to(self.device)          # (T,B)
+        rewards = batch["rewards"].to(self.device)        # (T,B)
+        dones = batch["dones"].to(self.device)            # (T,B)
+        last_values = batch["last_values"].to(self.device)  # (B,)
+        masks = batch.get("masks", None)
+        if masks is not None:
+            masks = masks.to(self.device)
+        h0 = batch.get("h0", None)
+        if isinstance(h0, tuple):
+            h0 = tuple(x.to(self.device) for x in h0)
+        elif h0 is not None:
+            h0 = h0.to(self.device)
+
+        adv, returns = compute_gae(rewards, values, dones, last_values, self.gamma, self.gae_lambda)
+        adv = self._norm_adv(adv)
+
+        T, B = rewards.shape
+        metrics = {"loss_pi": 0.0, "loss_v": 0.0, "entropy": 0.0, "kl": 0.0, "clipfrac": 0.0}
+        num_updates = 0
+
+        if self.recurrent:
+            env_indices = torch.arange(B, device=self.device)
+            mb_size = max(1, min(self.batch_size, B))
+            for _ in range(self.epochs):
+                perm = env_indices[torch.randperm(B)]
+                for start in range(0, B, mb_size):
+                    idx = perm[start:start + mb_size]
+                    o = obs[:, idx]
+                    a = actions[:, idx]
+                    lp_old = old_logp[:, idx]
+                    v_old = values[:, idx]
+                    adv_mb = adv[:, idx]
+                    ret_mb = returns[:, idx]
+                    h0_mb = None
+                    if h0 is not None:
+                        if isinstance(h0, tuple):
+                            h0_mb = (h0[0][:, idx], h0[1][:, idx])
+                        else:
+                            h0_mb = h0[:, idx]
+                    m_mb = masks[:, idx] if masks is not None else None
+
+                    new_logp, entropy, v = self.policy.evaluate_actions(o, a, h0=h0_mb, masks=m_mb)
+                    ratio = (new_logp - lp_old).exp()
+                    surr1 = ratio * adv_mb
+                    surr2 = torch.clamp(ratio, 1.0 - self.clip_epsilon, 1.0 + self.clip_epsilon) * adv_mb
+                    loss_pi = -torch.min(surr1, surr2).mean()
+                    if self.clip_value_loss:
+                        v_clipped = v_old + (v - v_old).clamp(-self.clip_epsilon, self.clip_epsilon)
+                        loss_v = 0.5 * torch.max((v - ret_mb).pow(2), (v_clipped - ret_mb).pow(2)).mean()
+                    else:
+                        loss_v = 0.5 * (v - ret_mb).pow(2).mean()
+                    ent = entropy.mean()
+                    loss = loss_pi + self.value_coef * loss_v - self.entropy_coef * ent
+
+                    self.optimizer.zero_grad(set_to_none=True)
+                    loss.backward()
+                    nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
+                    self.optimizer.step()
+
+                    with torch.no_grad():
+                        kl = (lp_old - new_logp).mean().abs()
+                        clipfrac = (ratio.gt(1.0 + self.clip_epsilon) | ratio.lt(1.0 - self.clip_epsilon)).float().mean()
+
+                    metrics["loss_pi"] += loss_pi.item()
+                    metrics["loss_v"] += loss_v.item()
+                    metrics["entropy"] += ent.item()
+                    metrics["kl"] += kl.item()
+                    metrics["clipfrac"] += clipfrac.item()
+                    num_updates += 1
+        else:
+            Tflat, Bflat = T * B, 1
+            o = obs.reshape(Tflat, *obs.shape[2:])
+            a = actions.reshape(Tflat, *actions.shape[2:]) if actions.dim() > 2 else actions.reshape(Tflat)
+            lp_old = old_logp.reshape(Tflat)
+            v_old = values.reshape(Tflat)
+            adv_flat = adv.reshape(Tflat)
+            ret_flat = returns.reshape(Tflat)
+            mb_size = max(1, min(self.batch_size, Tflat))
+            for _ in range(self.epochs):
+                perm = torch.randperm(Tflat, device=self.device)
+                for start in range(0, Tflat, mb_size):
+                    idx = perm[start:start + mb_size]
+                    new_logp, entropy, v = self.policy.evaluate_actions(o[idx], a[idx], h0=None, masks=None)
+                    ratio = (new_logp - lp_old[idx]).exp()
+                    surr1 = ratio * adv_flat[idx]
+                    surr2 = torch.clamp(ratio, 1.0 - self.clip_epsilon, 1.0 + self.clip_epsilon) * adv_flat[idx]
+                    loss_pi = -torch.min(surr1, surr2).mean()
+                    if self.clip_value_loss:
+                        v_clipped = v_old[idx] + (v - v_old[idx]).clamp(-self.clip_epsilon, self.clip_epsilon)
+                        loss_v = 0.5 * torch.max((v - ret_flat[idx]).pow(2), (v_clipped - ret_flat[idx]).pow(2)).mean()
+                    else:
+                        loss_v = 0.5 * (v - ret_flat[idx]).pow(2).mean()
+                    ent = entropy.mean()
+                    loss = loss_pi + self.value_coef * loss_v - self.entropy_coef * ent
+
+                    self.optimizer.zero_grad(set_to_none=True)
+                    loss.backward()
+                    nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
+                    self.optimizer.step()
+
+                    with torch.no_grad():
+                        kl = (lp_old[idx] - new_logp).mean().abs()
+                        clipfrac = (ratio.gt(1.0 + self.clip_epsilon) | ratio.lt(1.0 - self.clip_epsilon)).float().mean()
+
+                    metrics["loss_pi"] += loss_pi.item()
+                    metrics["loss_v"] += loss_v.item()
+                    metrics["entropy"] += ent.item()
+                    metrics["kl"] += kl.item()
+                    metrics["clipfrac"] += clipfrac.item()
+                    num_updates += 1
+
+        for k in metrics:
+            metrics[k] = metrics[k] / max(1, num_updates)
+        return {**metrics, "updates": num_updates}
